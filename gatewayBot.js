@@ -1,59 +1,122 @@
-// gatewayBot.js — Node 20 (Railway)
-// Always-on Discord Gateway listener for reaction → role + Dynamo status updates
+// gatewayBot.js — Node 20+
+// Multi-tenant Discord Gateway listener:
+// reaction (💰) -> add/remove Active role + update Dynamo Agent status
 //
-// Install:
+// Requires:
 //   npm i discord.js @aws-sdk/client-dynamodb @aws-sdk/lib-dynamodb
 //
-// Env:
+// ENV (Railway):
 //   DISCORD_BOT_TOKEN=...
-//   CLIENT_KEY=client1
-//   AGENTS_TABLE=Agents
-//   AGENTS_DISCORD_GSI=Agents_DiscordUser_GSI
+//   AWS_REGION=us-east-1
 //
-//   ACTIVE_ROLE_ID=1477879654223446233
-//   TARGET_MESSAGE_ID=1477890524563116063
+//   CLIENTS_TABLE=Clients
+//   CLIENTS_GUILD_GSI=Clients_DiscordGuild_GSI          // PK: discord_guild_id, SK: client_key
+//
+//   AGENTS_TABLE=Agents
+//   AGENTS_DISCORD_GSI=Agents_DiscordUser_GSI           // PK: client_key, SK: discord_user_id
+//
+//   ACTIVE_ROLE_ID=...
 //   TARGET_EMOJI=💰
 //
 //   STATUS_ON_ADD=Available
 //   STATUS_ON_REMOVE=Break
 //
-//   AWS_REGION=us-east-1 (optional)
+// OPTIONAL:
+//   CLIENT_ACTIVE_MARKER_MESSAGE_ATTR=active_marker_message_id  // attribute in Clients row
+//   CACHE_TTL_MS=300000                                         // 5m default
+//   DEBUG=true
 
-const { Client, GatewayIntentBits, Partials } = require("discord.js");
+"use strict";
+
+const { Client, GatewayIntentBits, Partials, Events } = require("discord.js");
 const { DynamoDBClient } = require("@aws-sdk/client-dynamodb");
-const { DynamoDBDocumentClient, QueryCommand, UpdateCommand } = require("@aws-sdk/lib-dynamodb");
+const {
+  DynamoDBDocumentClient,
+  QueryCommand,
+  UpdateCommand,
+} = require("@aws-sdk/lib-dynamodb");
+
+// -------------------- ENV --------------------
+function mustEnv(name) {
+  const v = process.env[name];
+  if (!v) throw new Error(`Missing ${name}`);
+  return v;
+}
 
 const REGION = process.env.AWS_REGION || "us-east-1";
+const DEBUG = String(process.env.DEBUG || "").toLowerCase() === "true";
 
-const DISCORD_BOT_TOKEN = process.env.DISCORD_BOT_TOKEN;
-const CLIENT_KEY = process.env.CLIENT_KEY;
+const DISCORD_BOT_TOKEN = mustEnv("DISCORD_BOT_TOKEN");
+
+const CLIENTS_TABLE = mustEnv("CLIENTS_TABLE");
+const CLIENTS_GUILD_GSI = mustEnv("CLIENTS_GUILD_GSI");
 
 const AGENTS_TABLE = process.env.AGENTS_TABLE || "Agents";
 const AGENTS_DISCORD_GSI = process.env.AGENTS_DISCORD_GSI || "Agents_DiscordUser_GSI";
 
-const ACTIVE_ROLE_ID = process.env.ACTIVE_ROLE_ID;
-const TARGET_MESSAGE_ID = process.env.TARGET_MESSAGE_ID;
+const ACTIVE_ROLE_ID = mustEnv("ACTIVE_ROLE_ID");
 const TARGET_EMOJI = process.env.TARGET_EMOJI || "💰";
 
 const STATUS_ON_ADD = process.env.STATUS_ON_ADD || "Available";
 const STATUS_ON_REMOVE = process.env.STATUS_ON_REMOVE || "Break";
 
-function must(name, val) {
-  if (!val) throw new Error(`Missing ${name}`);
-  return val;
-}
+const CLIENT_ACTIVE_MARKER_MESSAGE_ATTR =
+  process.env.CLIENT_ACTIVE_MARKER_MESSAGE_ATTR || "active_marker_message_id";
 
-must("DISCORD_BOT_TOKEN", DISCORD_BOT_TOKEN);
-must("CLIENT_KEY", CLIENT_KEY);
-must("ACTIVE_ROLE_ID", ACTIVE_ROLE_ID);
-must("TARGET_MESSAGE_ID", TARGET_MESSAGE_ID);
+const CACHE_TTL_MS = Number(process.env.CACHE_TTL_MS || "300000"); // 5 minutes default
 
+// -------------------- AWS Dynamo --------------------
 const ddb = DynamoDBDocumentClient.from(new DynamoDBClient({ region: REGION }), {
   marshallOptions: { removeUndefinedValues: true },
 });
 
 function nowIso() {
   return new Date().toISOString();
+}
+
+// -------------------- Caching --------------------
+// Cache guild_id -> client row to reduce Dynamo queries
+const guildCache = new Map(); // guildId -> { expiresAt, client }
+
+function cacheGetGuild(guildId) {
+  const hit = guildCache.get(guildId);
+  if (!hit) return null;
+  if (Date.now() > hit.expiresAt) {
+    guildCache.delete(guildId);
+    return null;
+  }
+  return hit.client;
+}
+
+function cacheSetGuild(guildId, client) {
+  guildCache.set(guildId, { expiresAt: Date.now() + CACHE_TTL_MS, client });
+}
+
+// -------------------- Dynamo access --------------------
+async function getClientByGuildId(guildId) {
+  const cached = cacheGetGuild(guildId);
+  if (cached) return cached;
+
+  const out = await ddb.send(
+    new QueryCommand({
+      TableName: CLIENTS_TABLE,
+      IndexName: CLIENTS_GUILD_GSI,
+      KeyConditionExpression: "discord_guild_id = :g",
+      ExpressionAttributeValues: { ":g": String(guildId) },
+      Limit: 2,
+    })
+  );
+
+  const items = out?.Items || [];
+  if (items.length === 0) return null;
+  if (items.length > 1) {
+    // This should never happen if guild_id is unique per client
+    throw new Error(`Multiple clients match guild_id=${guildId}`);
+  }
+
+  const client = items[0];
+  cacheSetGuild(guildId, client);
+  return client;
 }
 
 async function findAgentByDiscordUserId({ client_key, discord_user_id }) {
@@ -63,123 +126,161 @@ async function findAgentByDiscordUserId({ client_key, discord_user_id }) {
       IndexName: AGENTS_DISCORD_GSI,
       KeyConditionExpression: "client_key = :ck AND discord_user_id = :du",
       ExpressionAttributeValues: {
-        ":ck": client_key,
-        ":du": discord_user_id,
+        ":ck": String(client_key),
+        ":du": String(discord_user_id),
       },
-      Limit: 1,
+      Limit: 2,
     })
   );
 
-  return out?.Items?.[0] || null;
+  const items = out?.Items || [];
+  if (items.length === 0) return null;
+  if (items.length > 1) {
+    // Should never happen; means same discord_user_id linked to multiple agents in same client
+    throw new Error(`Multiple agents linked for client_key=${client_key} discord_user_id=${discord_user_id}`);
+  }
+  return items[0];
 }
 
 async function updateAgentStatus({ client_key, agent_id, status, discord_user_id }) {
   await ddb.send(
     new UpdateCommand({
       TableName: AGENTS_TABLE,
-      Key: { client_key, agent_id },
+      Key: { client_key: String(client_key), agent_id: String(agent_id) },
       ConditionExpression: "discord_user_id = :du",
-      UpdateExpression: "SET #st = :s, last_status_change_at = :now, updated_at = :now",
+      UpdateExpression:
+        "SET #st = :s, last_status_change_at = :now, updated_at = :now",
       ExpressionAttributeNames: { "#st": "status" },
       ExpressionAttributeValues: {
-        ":s": status,
+        ":s": String(status),
         ":now": nowIso(),
-        ":du": discord_user_id,
+        ":du": String(discord_user_id),
       },
     })
   );
 }
 
+// -------------------- Discord client --------------------
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
-    GatewayIntentBits.GuildMembers, // needed for role ops + member fetch
-    GatewayIntentBits.GuildMessageReactions,
+    GatewayIntentBits.GuildMembers,           // required to add/remove roles
+    GatewayIntentBits.GuildMessages,          // message context
+    GatewayIntentBits.GuildMessageReactions,  // reaction events
   ],
-  partials: [Partials.Message, Partials.Channel, Partials.Reaction],
+  partials: [
+    Partials.Message,
+    Partials.Channel,
+    Partials.Reaction,
+    Partials.User,
+    Partials.GuildMember,
+  ],
 });
 
-function log(obj) {
-  console.log(JSON.stringify({ ts: nowIso(), ...obj }));
+client.once(Events.ClientReady, () => {
+  console.log(`READY: ${client.user.tag}`);
+});
+
+// -------------------- Helpers --------------------
+function emojiMatches(reaction) {
+  // For unicode emoji: reaction.emoji.name === "💰"
+  // For custom emoji: you'll need to match on emoji.id instead (not implemented here)
+  const name = reaction?.emoji?.name || "";
+  return name === TARGET_EMOJI;
 }
 
-// discord.js v15 renamed "ready" -> "clientReady"
-// support both without breaking either version.
-client.once("ready", () => log({ level: "info", msg: "READY", tag: client.user?.tag || null }));
-client.once("clientReady", () => log({ level: "info", msg: "CLIENT_READY", tag: client.user?.tag || null }));
+async function ensureFetched(reaction) {
+  if (reaction.partial) await reaction.fetch();
+  if (reaction.message?.partial) await reaction.message.fetch();
+}
 
-async function handleMoneybagReaction(reaction, user, action) {
+async function handleReaction(reaction, user, action) {
   try {
-    if (!reaction) return;
-    if (!user || user.bot) return;
+    if (!reaction || !user) return;
+    if (user.bot) return;
 
-    // Resolve partials
-    if (reaction.partial) await reaction.fetch();
-    if (reaction.message?.partial) await reaction.message.fetch();
+    await ensureFetched(reaction);
+
+    if (!emojiMatches(reaction)) return;
 
     const msg = reaction.message;
-    if (!msg?.id) return;
-
-    // Only the one “active marker” message
-    if (String(msg.id) !== String(TARGET_MESSAGE_ID)) return;
-
-    // Emoji match
-    const emojiName = reaction.emoji?.name || "";
-    if (String(emojiName) !== String(TARGET_EMOJI)) return;
-
-    const guild = msg.guild;
+    const guild = msg?.guild;
     if (!guild) return;
 
-    log({
-      level: "info",
-      msg: "REACTION_MATCH",
-      action,
-      guild: guild.id,
-      channel: msg.channel?.id || null,
-      message: msg.id,
-      user: user.id,
-      emoji: emojiName,
-    });
+    const guildId = String(guild.id);
 
-    // Find linked agent
-    const agent = await findAgentByDiscordUserId({
-      client_key: CLIENT_KEY,
-      discord_user_id: user.id,
-    });
-
-    if (!agent) {
-      log({ level: "warn", msg: "NO_AGENT_LINK", user: user.id, client_key: CLIENT_KEY });
+    // Resolve client by guild id
+    const clientRow = await getClientByGuildId(guildId);
+    if (!clientRow) {
+      console.log(`NO_TENANT_MAPPING: guild=${guildId}`);
       return;
     }
 
-    // Fetch member (requires GuildMembers intent)
-    const member = await guild.members.fetch(user.id);
+    const client_key = String(clientRow.client_key || "");
+    if (!client_key) {
+      console.log(`NO_CLIENT_KEY_IN_CLIENT_ROW: guild=${guildId}`);
+      return;
+    }
+
+    // Optional guard: only react to the configured marker message per client
+    const markerMessageId = String(clientRow[CLIENT_ACTIVE_MARKER_MESSAGE_ATTR] || "");
+    if (!markerMessageId) {
+      console.log(`NO_ACTIVE_MARKER: client_key=${client_key} guild=${guildId}`);
+      return;
+    }
+    if (String(msg.id) !== markerMessageId) return;
+
+    // Find linked agent
+    const agent = await findAgentByDiscordUserId({
+      client_key,
+      discord_user_id: String(user.id),
+    });
+
+    if (!agent) {
+      console.log(`IGNORED_NOT_LINKED: client_key=${client_key} user=${user.id}`);
+      return;
+    }
+
+    // Fetch member
+    const member = await guild.members.fetch(String(user.id));
 
     if (action === "added") {
-      await member.roles.add(String(ACTIVE_ROLE_ID), "Reacted 💰 to activate");
+      await member.roles.add(ACTIVE_ROLE_ID, `Reacted ${TARGET_EMOJI} to activate`);
       await updateAgentStatus({
-        client_key: CLIENT_KEY,
-        agent_id: agent.agent_id,
+        client_key,
+        agent_id: String(agent.agent_id),
         status: STATUS_ON_ADD,
-        discord_user_id: user.id,
+        discord_user_id: String(user.id),
       });
-      log({ level: "info", msg: "ROLE_ADDED_STATUS_SET", user: user.id, agent_id: agent.agent_id, status: STATUS_ON_ADD });
+      console.log(`OK_ADD: client=${client_key} user=${user.id} agent=${agent.agent_id} -> ${STATUS_ON_ADD}`);
     } else {
-      await member.roles.remove(String(ACTIVE_ROLE_ID), "Removed 💰 to break");
+      await member.roles.remove(ACTIVE_ROLE_ID, `Removed ${TARGET_EMOJI} to break`);
       await updateAgentStatus({
-        client_key: CLIENT_KEY,
-        agent_id: agent.agent_id,
+        client_key,
+        agent_id: String(agent.agent_id),
         status: STATUS_ON_REMOVE,
-        discord_user_id: user.id,
+        discord_user_id: String(user.id),
       });
-      log({ level: "info", msg: "ROLE_REMOVED_STATUS_SET", user: user.id, agent_id: agent.agent_id, status: STATUS_ON_REMOVE });
+      console.log(`OK_REMOVE: client=${client_key} user=${user.id} agent=${agent.agent_id} -> ${STATUS_ON_REMOVE}`);
     }
   } catch (err) {
-    log({ level: "error", msg: "REACTION_ERROR", error: err?.message || String(err) });
+    const msg = err?.message || String(err);
+    console.error("REACTION_ERROR:", msg);
+    if (DEBUG && err?.stack) console.error(err.stack);
   }
 }
 
-client.on("messageReactionAdd", (reaction, user) => handleMoneybagReaction(reaction, user, "added"));
-client.on("messageReactionRemove", (reaction, user) => handleMoneybagReaction(reaction, user, "removed"));
+// Reaction add/remove
+client.on(Events.MessageReactionAdd, async (reaction, user) => {
+  await handleReaction(reaction, user, "added");
+});
 
-client.login(DISCORD_BOT_TOKEN);
+client.on(Events.MessageReactionRemove, async (reaction, user) => {
+  await handleReaction(reaction, user, "removed");
+});
+
+// Start
+client.login(DISCORD_BOT_TOKEN).catch((e) => {
+  console.error("LOGIN_FAILED:", e?.message || e);
+  process.exit(1);
+});

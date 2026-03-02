@@ -1,0 +1,14 @@
+{
+  "name": "mas-leads-gateway-bot",
+  "version": "1.0.0",
+  "main": "gatewayBot.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node gatewayBot.js"
+  },
+  "dependencies": {
+    "discord.js": "^14.16.3",
+    "@aws-sdk/client-dynamodb": "^3.758.0",
+    "@aws-sdk/lib-dynamodb": "^3.758.0"
+  }
+}

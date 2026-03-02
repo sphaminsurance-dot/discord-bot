@@ -1,141 +1,68 @@
-// gatewayBot.js — Node 20+ (Railway)
-// Discord Gateway listener: reaction add/remove -> add/remove role
-// Scoped to EXACT message + channel.
-// Multi-tenant: resolves client_key from Clients table via Clients_DiscordGuild_GSI,
-// then resolves agent via Agents_DiscordUser_GSI and updates status (optional).
-
-"use strict";
+// gatewayBot.js — Always-on Discord Gateway listener (Railway)
+// Reaction 💰 on a specific message in a specific channel -> add/remove Active role
+// Bot also reacts to that same message with 💰 for visibility (once) but NEVER changes its own role
+// Dynamo status updates are attempted on every matching reaction (logs if misconfigured)
+//
+// npm i discord.js @aws-sdk/client-dynamodb @aws-sdk/lib-dynamodb
+//
+// Required ENV:
+//   DISCORD_BOT_TOKEN=...
+//   ACTIVE_ROLE_ID=1477879654223446233
+//   TARGET_MESSAGE_ID=1477890524563116063
+//   ACTIVE_MARKER_CHANNEL_ID=1477879654848135265
+//   TARGET_EMOJI=💰
+//
+// Required-for-Dynamo (given your GSI shape):
+//   CLIENT_KEY=client1
+//   AGENTS_TABLE=Agents
+//   AGENTS_DISCORD_GSI=Agents_DiscordUser_GSI
+//   AWS_REGION=us-east-1
+//   STATUS_ON_ADD=Available
+//   STATUS_ON_REMOVE=Break
 
 const { Client, GatewayIntentBits, Partials } = require("discord.js");
 const { DynamoDBClient } = require("@aws-sdk/client-dynamodb");
-const {
-  DynamoDBDocumentClient,
-  QueryCommand,
-  UpdateCommand,
-} = require("@aws-sdk/lib-dynamodb");
+const { DynamoDBDocumentClient, QueryCommand, UpdateCommand } = require("@aws-sdk/lib-dynamodb");
 
-// -------------------- ENV --------------------
 function must(name) {
-  const val = process.env[name];
-  if (!val) throw new Error(`Missing ${name}`);
-  return val;
+  const v = process.env[name];
+  if (!v) throw new Error(`Missing ${name}`);
+  return v;
 }
-
-function opt(name, fallback = "") {
-  const val = process.env[name];
-  return val == null ? fallback : val;
-}
-
-const REGION = opt("AWS_REGION", "us-east-1");
 
 const DISCORD_BOT_TOKEN = must("DISCORD_BOT_TOKEN");
 
-// EXACT targets you specified (now OPTIONAL to prevent crash)
-const ACTIVE_ROLE_ID = opt("ACTIVE_ROLE_ID", "");
-const TARGET_MESSAGE_ID = opt("TARGET_MESSAGE_ID", "");
-const ACTIVE_MARKER_CHANNEL_ID = opt("ACTIVE_MARKER_CHANNEL_ID", "");
-const TARGET_EMOJI = opt("TARGET_EMOJI", "💰"); // optional enforcement
+const ACTIVE_ROLE_ID = must("ACTIVE_ROLE_ID");
+const TARGET_MESSAGE_ID = must("TARGET_MESSAGE_ID");
+const ACTIVE_MARKER_CHANNEL_ID = must("ACTIVE_MARKER_CHANNEL_ID");
+const TARGET_EMOJI = process.env.TARGET_EMOJI || "💰";
 
-// Dynamo (multi-tenant) (required if you want DB updates)
-const CLIENTS_TABLE = opt("CLIENTS_TABLE", "");
-const CLIENTS_GUILD_GSI = opt("CLIENTS_GUILD_GSI", "");
-const AGENTS_TABLE = opt("AGENTS_TABLE", "");
-const AGENTS_DISCORD_GSI = opt("AGENTS_DISCORD_GSI", "");
+// Dynamo (we will ALWAYS attempt to update; if env missing we will log loudly)
+const REGION = process.env.AWS_REGION || "us-east-1";
+const CLIENT_KEY = process.env.CLIENT_KEY || ""; // required for your current GSI shape
+const AGENTS_TABLE = process.env.AGENTS_TABLE || "Agents";
+const AGENTS_DISCORD_GSI = process.env.AGENTS_DISCORD_GSI || "Agents_DiscordUser_GSI";
+const STATUS_ON_ADD = process.env.STATUS_ON_ADD || "Available";
+const STATUS_ON_REMOVE = process.env.STATUS_ON_REMOVE || "Break";
 
-// Optional statuses written to Agents table
-const STATUS_ON_ADD = opt("STATUS_ON_ADD", "Available");
-const STATUS_ON_REMOVE = opt("STATUS_ON_REMOVE", "Break");
-
-// Startup diagnostics
-function startupReport() {
-  const missing = [];
-  if (!ACTIVE_ROLE_ID) missing.push("ACTIVE_ROLE_ID");
-  if (!TARGET_MESSAGE_ID) missing.push("TARGET_MESSAGE_ID");
-  if (!ACTIVE_MARKER_CHANNEL_ID) missing.push("ACTIVE_MARKER_CHANNEL_ID");
-
-  if (missing.length) {
-    console.warn(
-      `WARNING: Missing required target env vars: ${missing.join(
-        ", "
-      )}. Role changes will be disabled until set.`
-    );
-  } else {
-    console.log(
-      `CONFIG: role=${ACTIVE_ROLE_ID} channel=${ACTIVE_MARKER_CHANNEL_ID} message=${TARGET_MESSAGE_ID} emoji=${TARGET_EMOJI || "(any)"}`
-    );
-  }
-
-  const dbMissing = [];
-  if (!CLIENTS_TABLE) dbMissing.push("CLIENTS_TABLE");
-  if (!CLIENTS_GUILD_GSI) dbMissing.push("CLIENTS_GUILD_GSI");
-  if (!AGENTS_TABLE) dbMissing.push("AGENTS_TABLE");
-  if (!AGENTS_DISCORD_GSI) dbMissing.push("AGENTS_DISCORD_GSI");
-
-  if (dbMissing.length) {
-    console.warn(
-      `WARNING: Missing Dynamo env vars: ${dbMissing.join(
-        ", "
-      )}. Dynamo status updates will be disabled.`
-    );
-  } else {
-    console.log(
-      `DYNAMO: Clients=${CLIENTS_TABLE}(${CLIENTS_GUILD_GSI}) Agents=${AGENTS_TABLE}(${AGENTS_DISCORD_GSI})`
-    );
-  }
-}
-
-startupReport();
-
-// -------------------- Dynamo clients (optional) --------------------
-let ddb = null;
-const dynamoEnabled =
-  CLIENTS_TABLE && CLIENTS_GUILD_GSI && AGENTS_TABLE && AGENTS_DISCORD_GSI;
-
-if (dynamoEnabled) {
-  ddb = DynamoDBDocumentClient.from(new DynamoDBClient({ region: REGION }), {
-    marshallOptions: { removeUndefinedValues: true },
-  });
-}
+const ddb = DynamoDBDocumentClient.from(new DynamoDBClient({ region: REGION }), {
+  marshallOptions: { removeUndefinedValues: true },
+});
 
 function nowIso() {
   return new Date().toISOString();
 }
 
-// -------------------- Client lookup (guild -> client_key) --------------------
-async function getClientByGuildId(guild_id) {
-  if (!dynamoEnabled) return null;
-
-  const out = await ddb.send(
-    new QueryCommand({
-      TableName: CLIENTS_TABLE,
-      IndexName: CLIENTS_GUILD_GSI,
-      KeyConditionExpression: "discord_guild_id = :g",
-      ExpressionAttributeValues: { ":g": String(guild_id) },
-      Limit: 2,
-    })
-  );
-
-  const items = out?.Items || [];
-  if (items.length === 1) return items[0];
-  if (items.length > 1) {
-    console.warn(`MULTI_CLIENT_MATCH guild=${guild_id} count=${items.length}`);
-    return items[0]; // fail-soft
-  }
-  return null;
-}
-
-// -------------------- Agent lookup & status update --------------------
+// Your current Agents_DiscordUser_GSI is PK=client_key, SK=discord_user_id
 async function findAgentByDiscordUserId({ client_key, discord_user_id }) {
-  if (!dynamoEnabled) return null;
-
   const out = await ddb.send(
     new QueryCommand({
       TableName: AGENTS_TABLE,
       IndexName: AGENTS_DISCORD_GSI,
       KeyConditionExpression: "client_key = :ck AND discord_user_id = :du",
       ExpressionAttributeValues: {
-        ":ck": String(client_key),
-        ":du": String(discord_user_id),
+        ":ck": client_key,
+        ":du": discord_user_id,
       },
       Limit: 1,
     })
@@ -144,133 +71,144 @@ async function findAgentByDiscordUserId({ client_key, discord_user_id }) {
   return out?.Items?.[0] || null;
 }
 
-async function updateAgentStatus({ client_key, agent_id, status }) {
-  if (!dynamoEnabled) return;
-
-  const now = nowIso();
+async function updateAgentStatus({ client_key, agent_id, status, discord_user_id }) {
   await ddb.send(
     new UpdateCommand({
       TableName: AGENTS_TABLE,
-      Key: { client_key: String(client_key), agent_id: String(agent_id) },
-      UpdateExpression:
-        "SET #st = :s, last_status_change_at = :now, updated_at = :now",
+      Key: { client_key, agent_id },
+      ConditionExpression: "discord_user_id = :du",
+      UpdateExpression: "SET #st = :s, last_status_change_at = :now, updated_at = :now",
       ExpressionAttributeNames: { "#st": "status" },
-      ExpressionAttributeValues: { ":s": status, ":now": now },
+      ExpressionAttributeValues: {
+        ":s": status,
+        ":now": nowIso(),
+        ":du": discord_user_id,
+      },
     })
   );
 }
 
-// -------------------- Discord client --------------------
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
-    GatewayIntentBits.GuildMembers, // required to add/remove roles
-    GatewayIntentBits.GuildMessageReactions, // reaction add/remove
+    GatewayIntentBits.GuildMembers,
+    GatewayIntentBits.GuildMessageReactions,
+    GatewayIntentBits.GuildMessages,
   ],
   partials: [Partials.Message, Partials.Channel, Partials.Reaction],
 });
 
-client.once("clientReady", () => {
+client.once("clientReady", async () => {
   console.log(`READY: ${client.user.tag}`);
+  console.log(
+    `CONFIG: role=${ACTIVE_ROLE_ID} channel=${ACTIVE_MARKER_CHANNEL_ID} message=${TARGET_MESSAGE_ID} emoji=${TARGET_EMOJI}`
+  );
+  console.log(
+    `DYNAMO: region=${REGION} client_key=${CLIENT_KEY || "(missing)"} table=${AGENTS_TABLE}(${AGENTS_DISCORD_GSI}) status_add=${STATUS_ON_ADD} status_remove=${STATUS_ON_REMOVE}`
+  );
+
+  // Add bot's own reaction to make the marker easy to see (one-time / idempotent)
+  try {
+    const channel = await client.channels.fetch(String(ACTIVE_MARKER_CHANNEL_ID));
+    if (!channel || !channel.isTextBased()) {
+      console.log("MARKER_REACT_SKIPPED: channel_not_text_based");
+      return;
+    }
+
+    const msg = await channel.messages.fetch(String(TARGET_MESSAGE_ID));
+    if (!msg) {
+      console.log("MARKER_REACT_SKIPPED: message_not_found");
+      return;
+    }
+
+    // react() is effectively idempotent; Discord won’t duplicate the same emoji reaction for the same user
+    await msg.react(TARGET_EMOJI);
+    console.log("MARKER_REACT_OK");
+  } catch (err) {
+    console.log("MARKER_REACT_FAIL:", err?.message || err);
+  }
 });
 
-// Core filter: must be exact message id + channel id (and optionally emoji)
-function isTargetReaction(reaction) {
-  if (!ACTIVE_ROLE_ID || !TARGET_MESSAGE_ID || !ACTIVE_MARKER_CHANNEL_ID) {
-    return false; // disabled until envs are set
-  }
+async function shouldHandle(reaction) {
+  if (reaction.partial) await reaction.fetch();
+  if (reaction.message?.partial) await reaction.message.fetch();
 
-  const msg = reaction?.message;
-  if (!msg?.id) return false;
+  const msg = reaction.message;
+  if (!msg?.id || !msg?.channelId) return false;
 
   if (String(msg.id) !== String(TARGET_MESSAGE_ID)) return false;
   if (String(msg.channelId) !== String(ACTIVE_MARKER_CHANNEL_ID)) return false;
 
-  // If TARGET_EMOJI is set, enforce it; if empty, allow any emoji
-  if (TARGET_EMOJI) {
-    const emojiName = reaction?.emoji?.name || "";
-    if (emojiName !== TARGET_EMOJI) return false;
-  }
+  const emojiName = reaction.emoji?.name || "";
+  if (emojiName !== TARGET_EMOJI) return false;
 
   return true;
 }
 
-async function ensureFetched(reaction) {
-  if (reaction?.partial) await reaction.fetch();
-  if (reaction?.message?.partial) await reaction.message.fetch();
+async function applyRoleChange({ guild, userId, add }) {
+  const member = await guild.members.fetch(userId);
+  if (add) {
+    await member.roles.add(ACTIVE_ROLE_ID, "Reacted to active marker");
+  } else {
+    await member.roles.remove(ACTIVE_ROLE_ID, "Removed reaction from active marker");
+  }
 }
 
-async function handleReactionChange(reaction, user, action /* "added"|"removed" */) {
+async function reportStatusToDynamo({ userId, add }) {
+  if (!CLIENT_KEY) {
+    console.log(`DDB_DISABLED_OR_MISCONFIGURED: Missing CLIENT_KEY (cannot resolve tenant) user=${userId}`);
+    return;
+  }
+
   try {
-    if (!user || user.bot) return;
+    const agent = await findAgentByDiscordUserId({
+      client_key: CLIENT_KEY,
+      discord_user_id: userId,
+    });
 
-    await ensureFetched(reaction);
+    if (!agent) {
+      console.log(`DDB_NO_AGENT_LINK: user=${userId} client_key=${CLIENT_KEY}`);
+      return;
+    }
 
-    if (!isTargetReaction(reaction)) return;
+    const status = add ? STATUS_ON_ADD : STATUS_ON_REMOVE;
+
+    await updateAgentStatus({
+      client_key: CLIENT_KEY,
+      agent_id: agent.agent_id,
+      status,
+      discord_user_id: userId,
+    });
+
+    console.log(`DDB_OK: user=${userId} agent=${agent.agent_id} -> ${status}`);
+  } catch (err) {
+    console.log(`DDB_FAIL: user=${userId} msg=${err?.message || err}`);
+  }
+}
+
+async function handleReaction(reaction, user, add) {
+  try {
+    // never process bots (including ourselves) for role changes OR Dynamo updates
+    if (user.bot) return;
+
+    const ok = await shouldHandle(reaction);
+    if (!ok) return;
 
     const guild = reaction.message.guild;
     if (!guild) return;
 
-    // Fetch member
-    const member = await guild.members.fetch(user.id);
+    // Role change first (what the agents see)
+    await applyRoleChange({ guild, userId: user.id, add });
+    console.log(`ROLE_OK: guild=${guild.id} user=${user.id} add=${add}`);
 
-    // Add/remove role
-    if (action === "added") {
-      await member.roles.add(ACTIVE_ROLE_ID, "Reacted on active marker message");
-    } else {
-      await member.roles.remove(ACTIVE_ROLE_ID, "Removed reaction on active marker message");
-    }
-
-    // Optional Dynamo updates
-    if (!dynamoEnabled) {
-      console.log(
-        `ROLE_OK_NO_DYNAMO: action=${action} guild=${guild.id} user=${user.id}`
-      );
-      return;
-    }
-
-    const clientRow = await getClientByGuildId(guild.id);
-    if (!clientRow?.client_key) {
-      console.warn(`NO_TENANT_MAPPING: guild=${guild.id}`);
-      return;
-    }
-
-    const agent = await findAgentByDiscordUserId({
-      client_key: clientRow.client_key,
-      discord_user_id: user.id,
-    });
-
-    if (!agent?.agent_id) {
-      console.log(
-        `ROLE_OK_BUT_NO_AGENT_LINK: guild=${guild.id} user=${user.id} client=${clientRow.client_key}`
-      );
-      return;
-    }
-
-    const nextStatus = action === "added" ? STATUS_ON_ADD : STATUS_ON_REMOVE;
-    await updateAgentStatus({
-      client_key: clientRow.client_key,
-      agent_id: agent.agent_id,
-      status: nextStatus,
-    });
-
-    console.log(
-      `OK: action=${action} guild=${guild.id} channel=${reaction.message.channelId} msg=${reaction.message.id} user=${user.id} role=${ACTIVE_ROLE_ID} client=${clientRow.client_key} agent=${agent.agent_id} status=${nextStatus}`
-    );
+    // Then Dynamo reporting (what your router / dashboard sees)
+    await reportStatusToDynamo({ userId: user.id, add });
   } catch (err) {
-    console.error("REACTION_HANDLER_ERROR:", err?.message || err);
+    console.error("REACTION_ERROR:", err?.message || err);
   }
 }
 
-client.on("messageReactionAdd", async (reaction, user) => {
-  await handleReactionChange(reaction, user, "added");
-});
+client.on("messageReactionAdd", (reaction, user) => handleReaction(reaction, user, true));
+client.on("messageReactionRemove", (reaction, user) => handleReaction(reaction, user, false));
 
-client.on("messageReactionRemove", async (reaction, user) => {
-  await handleReactionChange(reaction, user, "removed");
-});
-
-client.login(DISCORD_BOT_TOKEN).catch((e) => {
-  console.error("LOGIN_FAILED:", e?.message || e);
-  process.exit(1);
-});
+client.login(DISCORD_BOT_TOKEN);

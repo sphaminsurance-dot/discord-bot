@@ -7,6 +7,7 @@
 //
 // npm i discord.js @aws-sdk/client-dynamodb @aws-sdk/lib-dynamodb
 
+const http = require("http");
 const { Client, GatewayIntentBits, Partials } = require("discord.js");
 const { DynamoDBClient } = require("@aws-sdk/client-dynamodb");
 const { DynamoDBDocumentClient, QueryCommand, UpdateCommand } = require("@aws-sdk/lib-dynamodb");
@@ -74,8 +75,6 @@ async function findAgentByDiscordUserId_Global({ discord_user_id }) {
   const items = out?.Items || [];
   if (items.length === 0) return null;
 
-  // If a Discord user could exist in multiple tenants, we need to choose.
-  // For now: if >1, log and refuse (prevents accidental wrong-tenant updates).
   if (items.length > 1) {
     console.log(
       `DDB_AMBIGUOUS_USER: discord_user_id=${discord_user_id} matches ${items.length} agents (multi-tenant collision)`
@@ -123,7 +122,7 @@ client.once("clientReady", async () => {
     `DYNAMO: region=${REGION} client_key=${CLIENT_KEY || "(missing)"} table=${AGENTS_TABLE} gsi=${AGENTS_DISCORD_GSI} global_gsi=${AGENTS_DISCORD_GLOBAL_GSI} status_add=${STATUS_ON_ADD} status_remove=${STATUS_ON_REMOVE}`
   );
 
-  // Add bot's reaction to the marker message for visibility (never affects bot's own roles)
+  // React to marker message for visibility
   try {
     const channel = await client.channels.fetch(String(ACTIVE_MARKER_CHANNEL_ID));
     if (!channel || !channel.isTextBased()) {
@@ -171,29 +170,30 @@ async function reportStatusToDynamo({ userId, add }) {
   const status = add ? STATUS_ON_ADD : STATUS_ON_REMOVE;
 
   try {
-    let agent = null;
-
     if (CLIENT_KEY) {
-      agent = await findAgentByDiscordUserId_SingleTenant({
+      const agent = await findAgentByDiscordUserId_SingleTenant({
         client_key: CLIENT_KEY,
         discord_user_id: userId,
       });
+
       if (!agent) {
         console.log(`DDB_NO_AGENT_LINK: user=${userId} client_key=${CLIENT_KEY}`);
         return;
       }
+
       await updateAgentStatus({
         client_key: CLIENT_KEY,
         agent_id: agent.agent_id,
         status,
         discord_user_id: userId,
       });
+
       console.log(`DDB_OK: user=${userId} agent=${agent.agent_id} client=${CLIENT_KEY} -> ${status}`);
       return;
     }
 
-    // Multi-tenant mode (no CLIENT_KEY set)
-    agent = await findAgentByDiscordUserId_Global({ discord_user_id: userId });
+    // Multi-tenant mode
+    const agent = await findAgentByDiscordUserId_Global({ discord_user_id: userId });
     if (!agent) {
       console.log(`DDB_NO_AGENT_LINK_OR_AMBIGUOUS: user=${userId}`);
       return;
@@ -244,3 +244,19 @@ client.on("messageReactionAdd", (reaction, user) => handleReaction(reaction, use
 client.on("messageReactionRemove", (reaction, user) => handleReaction(reaction, user, false));
 
 client.login(DISCORD_BOT_TOKEN);
+
+// ---- Keep-alive HTTP server for Railway/Web services expecting a PORT ----
+const PORT = Number(process.env.PORT || 3000);
+http
+  .createServer((req, res) => {
+    if (req.url === "/health") {
+      res.writeHead(200, { "content-type": "text/plain" });
+      res.end("ok");
+      return;
+    }
+    res.writeHead(200, { "content-type": "text/plain" });
+    res.end("MAS Leads gateway bot running");
+  })
+  .listen(PORT, "0.0.0.0", () => {
+    console.log(`HTTP_OK: listening on ${PORT}`);
+  });

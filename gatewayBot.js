@@ -1,7 +1,8 @@
 // gatewayBot.js — Node 20 (Railway)
   // Always-on Discord Gateway listener for:
-  //  1) reaction 💰 on marker message -> add/remove Active role + update agent status via Dashboard API
-  //  2) interactive buttons on lead messages -> update Leads row in Dynamo (connected/sold/no-answer/etc)
+  //  1) guildMemberAdd -> assign agent role + notify Dashboard API to grant category access
+  //  2) reaction 💰 on per-client active-marker messages -> update agent status via Dashboard API
+  //  3) interactive buttons on lead messages -> update Leads row in Dynamo
   //
   // Install:
   //   npm i discord.js @aws-sdk/client-dynamodb @aws-sdk/lib-dynamodb
@@ -9,23 +10,17 @@
   // Required Env:
   //   DISCORD_BOT_TOKEN=...
   //
-  // Marker (role toggle):
-  //   ACTIVE_ROLE_ID=1477879654223446233
-  //   ACTIVE_MARKER_CHANNEL_ID=1477879654848135265
-  //   TARGET_MESSAGE_ID=1477890524563116063
-  //   TARGET_EMOJI=💰
+  // Guild / role config:
+  //   GUILD_ID=1477879653795496091
+  //   ROLE_ID=1477879654210605187             (agent role assigned on join)
   //
-  // Dashboard API (agent status):
-  //   DASHBOARD_API_URL=https://your-replit-app.replit.app
+  // Dashboard API (agent status + member join):
+  //   MAS_API_URL=https://your-replit-app.replit.app
   //   BOT_API_TOKEN=...
   //
   // Dynamo (leads only):
   //   AWS_REGION=us-east-1
   //   LEADS_TABLE=Leads
-  //
-  // Status mapping:
-  //   STATUS_ON_ADD=Available
-  //   STATUS_ON_REMOVE=Break
   //
   // Optional:
   //   HEALTH_PORT=8080
@@ -47,22 +42,19 @@
 
   const DISCORD_BOT_TOKEN = mustEnv("DISCORD_BOT_TOKEN");
 
-  // Marker config
-  const ACTIVE_ROLE_ID = mustEnv("ACTIVE_ROLE_ID");
-  const ACTIVE_MARKER_CHANNEL_ID = mustEnv("ACTIVE_MARKER_CHANNEL_ID");
-  const TARGET_MESSAGE_ID = mustEnv("TARGET_MESSAGE_ID");
-  const TARGET_EMOJI = process.env.TARGET_EMOJI || "💰";
+  // Guild / role config
+  const GUILD_ID = process.env.GUILD_ID || "1477879653795496091";
+  const ROLE_ID = process.env.ROLE_ID || "1477879654210605187";
 
-  // Dashboard API config
-  const DASHBOARD_API_URL = mustEnv("DASHBOARD_API_URL");
+  // Dashboard API config (MAS_API_URL preferred; fall back to DASHBOARD_API_URL for backwards-compat)
+  const MAS_API_URL = process.env.MAS_API_URL || process.env.DASHBOARD_API_URL;
+  if (!MAS_API_URL) throw new Error("Missing MAS_API_URL");
   const BOT_API_TOKEN = mustEnv("BOT_API_TOKEN");
 
   // Dynamo config (leads only)
   const LEADS_TABLE = process.env.LEADS_TABLE || "Leads";
 
-  // Status mapping
-  const STATUS_ON_ADD = process.env.STATUS_ON_ADD || "Available";
-  const STATUS_ON_REMOVE = process.env.STATUS_ON_REMOVE || "Break";
+  const TARGET_EMOJI = "💰";
 
   function nowIso() {
     return new Date().toISOString();
@@ -72,10 +64,36 @@
     marshallOptions: { removeUndefinedValues: true },
   });
 
+  // -------------------- Active-marker cache --------------------
+  // Each entry: { active_marker_channel_id: string, active_marker_message_id: string }
+  let activeMarkers = [];
+
+  async function fetchActiveMarkers() {
+    try {
+      const resp = await dashboardRequest("GET", "/api/bot/active-markers");
+      if (resp.statusCode === 200 && Array.isArray(resp.data)) {
+        activeMarkers = resp.data;
+        console.log(`MARKERS_REFRESHED: count=${activeMarkers.length}`);
+      } else {
+        console.log(`MARKERS_FETCH_WARN: status=${resp.statusCode}`, resp.data);
+      }
+    } catch (err) {
+      console.error("MARKERS_FETCH_ERROR:", err?.message || err);
+    }
+  }
+
+  function isMarkerMessage(channelId, messageId) {
+    return activeMarkers.some(
+      (m) =>
+        String(m.active_marker_channel_id) === String(channelId) &&
+        String(m.active_marker_message_id) === String(messageId)
+    );
+  }
+
   // -------------------- Dashboard API helpers --------------------
   function dashboardRequest(method, path, body) {
     return new Promise((resolve, reject) => {
-      const url = new URL(path, DASHBOARD_API_URL);
+      const url = new URL(path, MAS_API_URL);
       const isHttps = url.protocol === "https:";
       const options = {
         method,
@@ -110,14 +128,6 @@
     });
   }
 
-  async function findAgentByDiscordUserId(discord_user_id) {
-    const resp = await dashboardRequest("GET", `/api/bot/agent-by-discord/${discord_user_id}`);
-    if (resp.statusCode === 200) return resp.data;
-    if (resp.statusCode === 404) return null;
-    console.log(`API_AGENT_LOOKUP_ERROR: status=${resp.statusCode}`, resp.data);
-    return null;
-  }
-
   async function updateAgentStatus({ discord_user_id, status }) {
     const resp = await dashboardRequest("POST", "/api/bot/agent-status", {
       discord_user_id,
@@ -137,6 +147,32 @@
       GatewayIntentBits.GuildMessages,
     ],
     partials: [Partials.Message, Partials.Channel, Partials.Reaction],
+  });
+
+  // -------------------- guildMemberAdd handler --------------------
+  client.on(Events.GuildMemberAdd, async (member) => {
+    try {
+      // Assign the standard agent role
+      await member.roles.add(ROLE_ID, "New member — auto-assign agent role");
+      console.log(`MEMBER_JOIN_ROLE_OK: guild=${member.guild.id} user=${member.user.id}`);
+    } catch (err) {
+      console.error(`MEMBER_JOIN_ROLE_FAIL: user=${member.user.id}`, err?.message || err);
+    }
+
+    try {
+      // Notify MAS Dashboard to grant category access if this user is a registered agent
+      const resp = await dashboardRequest("POST", "/api/bot/member-join", {
+        discord_user_id: member.user.id,
+      });
+      if (resp.statusCode === 200) {
+        console.log(`MEMBER_JOIN_API_OK: user=${member.user.id}`, resp.data);
+      } else {
+        console.log(`MEMBER_JOIN_API_WARN: user=${member.user.id} status=${resp.statusCode}`, resp.data);
+      }
+    } catch (err) {
+      // Fail silently on API errors per spec
+      console.error(`MEMBER_JOIN_API_FAIL: user=${member.user.id}`, err?.message || err);
+    }
   });
 
   // -------------------- Lead updates (buttons) --------------------
@@ -198,39 +234,22 @@
       if (reaction.message?.partial) await reaction.message.fetch();
 
       const msg = reaction.message;
-      if (!msg?.id || msg.id !== TARGET_MESSAGE_ID) return;
-      if (String(msg.channelId) !== String(ACTIVE_MARKER_CHANNEL_ID)) return;
+      if (!msg?.id) return;
+
+      // Check against dynamically-loaded marker list
+      if (!isMarkerMessage(msg.channelId, msg.id)) return;
 
       const emojiName = reaction.emoji?.name || "";
       if (emojiName !== TARGET_EMOJI) return;
 
-      const guild = msg.guild;
-      if (!guild) return;
-
-      const member = await guild.members.fetch(user.id);
-
-      if (added) {
-        await member.roles.add(ACTIVE_ROLE_ID, "Reacted to activate");
-        console.log(`ROLE_OK: guild=${guild.id} user=${user.id} add=true`);
-      } else {
-        await member.roles.remove(ACTIVE_ROLE_ID, "Removed reaction to deactivate");
-        console.log(`ROLE_OK: guild=${guild.id} user=${user.id} add=false`);
-      }
-
-      // Look up agent via Dashboard API (searches all clients)
-      const agent = await findAgentByDiscordUserId(user.id);
-      if (!agent) {
-        console.log(`ROLE_OK_BUT_NO_AGENT_LINK: guild=${guild.id} user=${user.id}`);
-        return;
-      }
-
-      const status = added ? STATUS_ON_ADD : STATUS_ON_REMOVE;
+      // Status-only: no role assignment or removal
+      const status = added ? "Available" : "Offline";
       const result = await updateAgentStatus({ discord_user_id: user.id, status });
 
       if (result?.ok) {
-        console.log(`STATUS_OK: client=${agent.client_key} agent=${agent.agent_id} -> ${status}`);
+        console.log(`STATUS_OK: user=${user.id} -> ${status}`);
       } else {
-        console.log(`STATUS_FAIL: client=${agent.client_key} agent=${agent.agent_id} status=${status}`);
+        console.log(`STATUS_FAIL: user=${user.id} status=${status}`);
       }
     } catch (err) {
       console.error("REACTION_ERROR:", err?.message || err);
@@ -271,33 +290,7 @@
     }
   }
 
-  // -------------------- Startup: react to marker message once --------------------
-  async function ensureMarkerReact() {
-    try {
-      const ch = await client.channels.fetch(ACTIVE_MARKER_CHANNEL_ID);
-      if (!ch || !ch.isTextBased()) return;
-
-      const msg = await ch.messages.fetch(TARGET_MESSAGE_ID);
-      if (!msg) return;
-
-      await msg.react(TARGET_EMOJI);
-      console.log("MARKER_REACT_OK");
-    } catch (err) {
-      console.log("MARKER_REACT_FAIL:", err?.message || err);
-    }
-  }
-
-  client.once(Events.ClientReady, async () => {
-    console.log(`READY: ${client.user.tag}`);
-    console.log(
-      `CONFIG: role=${ACTIVE_ROLE_ID} channel=${ACTIVE_MARKER_CHANNEL_ID} message=${TARGET_MESSAGE_ID} emoji=${TARGET_EMOJI}`
-    );
-    console.log(`DASHBOARD: ${DASHBOARD_API_URL}`);
-    console.log(`DYNAMO: region=${REGION} Leads=${LEADS_TABLE}`);
-
-    await ensureMarkerReact();
-  });
-
+  // -------------------- Event listeners --------------------
   client.on(Events.MessageReactionAdd, async (reaction, user) => {
     await handleMoneybagReaction(reaction, user, true);
   });
@@ -307,6 +300,18 @@
 
   client.on(Events.InteractionCreate, async (interaction) => {
     await handleLeadButton(interaction);
+  });
+
+  // -------------------- Startup --------------------
+  client.once(Events.ClientReady, async () => {
+    console.log(`READY: ${client.user.tag}`);
+    console.log(`CONFIG: guild=${GUILD_ID} role=${ROLE_ID}`);
+    console.log(`MAS_API: ${MAS_API_URL}`);
+    console.log(`DYNAMO: region=${REGION} Leads=${LEADS_TABLE}`);
+
+    // Fetch active markers on startup and refresh every 5 minutes
+    await fetchActiveMarkers();
+    setInterval(fetchActiveMarkers, 5 * 60 * 1000);
   });
 
   // Railway needs a port listener to keep the service healthy
